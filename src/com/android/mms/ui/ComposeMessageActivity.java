@@ -43,6 +43,8 @@ import java.util.regex.Pattern;
 import android.app.ActionBar;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Dialog;
+import android.app.LoaderManager;
 import android.app.ProgressDialog;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
@@ -51,16 +53,24 @@ import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.CursorLoader;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.DialogInterface.OnClickListener;
+import android.content.Loader;
+import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteException;
 import android.database.sqlite.SqliteWrapper;
 import android.drm.DrmStore;
+import android.gesture.Gesture;
+import android.gesture.GestureLibrary;
+import android.gesture.GestureOverlayView;
+import android.gesture.GestureOverlayView.OnGesturePerformedListener;
+import android.gesture.Prediction;
 import android.graphics.drawable.Drawable;
 import android.media.RingtoneManager;
 import android.net.Uri;
@@ -71,6 +81,7 @@ import android.os.Handler;
 import android.os.Message;
 import android.os.Parcelable;
 import android.os.SystemProperties;
+import android.preference.PreferenceManager;
 import android.provider.ContactsContract;
 import android.provider.ContactsContract.CommonDataKinds.Email;
 import android.provider.ContactsContract.Contacts;
@@ -95,10 +106,13 @@ import android.text.style.URLSpan;
 import android.text.util.Linkify;
 import android.util.Log;
 import android.view.ContextMenu;
+import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewGroup.LayoutParams;
 import android.view.ViewStub;
 import android.view.WindowManager;
 import android.view.ContextMenu.ContextMenuInfo;
@@ -107,11 +121,18 @@ import android.view.View.OnKeyListener;
 import android.view.inputmethod.InputMethodManager;
 import android.webkit.MimeTypeMap;
 import android.widget.AdapterView;
+import android.widget.CursorAdapter;
+import android.widget.AdapterView.OnItemClickListener;
+import android.widget.AdapterView.OnItemLongClickListener;
+import android.widget.Button;
 import android.widget.EditText;
+import android.widget.GridView;
 import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.ListView;
+import android.widget.ScrollView;
 import android.widget.SimpleAdapter;
+import android.widget.SimpleCursorAdapter;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -138,12 +159,15 @@ import com.google.android.mms.pdu.PduPersister;
 import com.google.android.mms.pdu.SendReq;
 import com.android.mms.model.SlideModel;
 import com.android.mms.model.SlideshowModel;
+import com.android.mms.templates.TemplateGesturesLibrary;
+import com.android.mms.templates.TemplatesProvider.Template;
 import com.android.mms.transaction.MessagingNotification;
 import com.android.mms.ui.MessageListView.OnSizeChangedListener;
 import com.android.mms.ui.MessageUtils.ResizeImageResultCallback;
 import com.android.mms.ui.RecipientsEditor.RecipientContextMenuInfo;
 import com.android.mms.util.AddressUtils;
 import com.android.mms.util.PhoneNumberFormatter;
+import com.android.mms.util.EmojiParser;
 import com.android.mms.util.SendingProgressTokenManager;
 import com.android.mms.util.SmileyParser;
 
@@ -164,7 +188,8 @@ import android.text.InputFilter.LengthFilter;
  */
 public class ComposeMessageActivity extends Activity
         implements View.OnClickListener, TextView.OnEditorActionListener,
-        MessageStatusListener, Contact.UpdateListener {
+        MessageStatusListener, Contact.UpdateListener, OnGesturePerformedListener,
+        LoaderManager.LoaderCallbacks<Cursor>  {
     public static final int REQUEST_CODE_ATTACH_IMAGE     = 100;
     public static final int REQUEST_CODE_TAKE_PICTURE     = 101;
     public static final int REQUEST_CODE_ATTACH_VIDEO     = 102;
@@ -213,6 +238,13 @@ public class ComposeMessageActivity extends Activity
     private static final int MENU_UNLOCK_MESSAGE        = 29;
     private static final int MENU_SAVE_RINGTONE         = 30;
     private static final int MENU_PREFERENCES           = 31;
+    private static final int MENU_ADD_TEMPLATE          = 32;
+    private static final int MENU_INSERT_EMOJI         = 33;
+
+    private static final int DIALOG_TEMPLATE_SELECT     = 1;
+    private static final int DIALOG_TEMPLATE_NOT_AVAILABLE = 2;
+    private static final int LOAD_TEMPLATE_BY_ID        = 0;
+    private static final int LOAD_TEMPLATES             = 1;
 
     private static final int RECIPIENTS_MAX_LENGTH = 312;
 
@@ -282,6 +314,8 @@ public class ComposeMessageActivity extends Activity
     private WorkingMessage mWorkingMessage;         // The message currently being composed.
 
     private AlertDialog mSmileyDialog;
+    private AlertDialog mEmojiDialog;
+    private View mEmojiView;
 
     private boolean mWaitingForSubActivity;
     private int mLastRecipientCount;            // Used for warning the user on too many recipients.
@@ -297,6 +331,11 @@ public class ComposeMessageActivity extends Activity
     private AsyncDialog mAsyncDialog;   // Used for background tasks.
 
     private String mDebugRecipients;
+
+    private GestureLibrary mLibrary;
+    private SimpleCursorAdapter mTemplatesCursorAdapter;
+    private double mGestureSensitivity;
+
     private int mLastSmoothScrollPosition;
     private boolean mScrollOnSend;      // Flag that we need to scroll the list to the end.
 
@@ -548,7 +587,7 @@ public class ComposeMessageActivity extends Activity
         int msgCount = params[0];
         int remainingInCurrentMessage = params[2];
 
-        if (!MmsConfig.getMultipartSmsEnabled()) {
+        if (!MmsConfig.getSplitSmsEnabled() && !MmsConfig.getMultipartSmsEnabled()) {
             // The provider doesn't support multi-part sms's so as soon as the user types
             // an sms longer than one segment, we have to turn the message into an mms.
             mWorkingMessage.setLengthRequiresMms(msgCount > 1, true);
@@ -1807,7 +1846,23 @@ public class ComposeMessageActivity extends Activity
 
         resetConfiguration(getResources().getConfiguration());
 
-        setContentView(R.layout.compose_message_activity);
+        SharedPreferences prefs = PreferenceManager
+                .getDefaultSharedPreferences((Context) ComposeMessageActivity.this);
+        mGestureSensitivity = prefs
+                .getInt(MessagingPreferenceActivity.GESTURE_SENSITIVITY_VALUE, 3);
+        boolean showGesture = prefs.getBoolean(MessagingPreferenceActivity.SHOW_GESTURE, false);
+
+        mLibrary = TemplateGesturesLibrary.getStore(this);
+
+        int layout = R.layout.compose_message_activity;
+
+        GestureOverlayView gestureOverlayView = new GestureOverlayView(this);
+        View inflate = getLayoutInflater().inflate(layout, null);
+        gestureOverlayView.addView(inflate);
+        gestureOverlayView.setEventsInterceptionEnabled(true);
+        gestureOverlayView.setGestureVisible(showGesture);
+        gestureOverlayView.addOnGesturePerformedListener(this);
+        setContentView(gestureOverlayView);
         setProgressBarVisibility(false);
 
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE |
@@ -2520,6 +2575,10 @@ public class ComposeMessageActivity extends Activity
                 .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);    // add to actionbar
         }
 
+        menu.add(0, MENU_ADD_TEMPLATE, 0, R.string.template_insert)
+            .setIcon(android.R.drawable.ic_menu_add)
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
+
         if (isPreparedForSending()) {
             menu.add(0, MENU_SEND, 0, R.string.send).setIcon(android.R.drawable.ic_menu_send);
         }
@@ -2527,6 +2586,12 @@ public class ComposeMessageActivity extends Activity
         if (!mWorkingMessage.hasSlideshow()) {
             menu.add(0, MENU_INSERT_SMILEY, 0, R.string.menu_insert_smiley).setIcon(
                     R.drawable.ic_menu_emoticons);
+            SharedPreferences prefs = PreferenceManager
+                    .getDefaultSharedPreferences((Context) ComposeMessageActivity.this);
+            boolean enableEmojis = prefs.getBoolean(MessagingPreferenceActivity.ENABLE_EMOJIS, false);
+            if (enableEmojis) {
+                menu.add(0, MENU_INSERT_EMOJI, 0, R.string.menu_insert_emoji);
+            }
         }
 
         if (mMsgListAdapter.getCount() > 0) {
@@ -2612,6 +2677,9 @@ public class ComposeMessageActivity extends Activity
             case MENU_INSERT_SMILEY:
                 showSmileyDialog();
                 break;
+            case MENU_INSERT_EMOJI:
+                showEmojiDialog();
+                break;
             case MENU_VIEW_CONTACT: {
                 // View the contact for the first (and only) recipient.
                 ContactList list = getRecipients();
@@ -2636,6 +2704,9 @@ public class ComposeMessageActivity extends Activity
                 mWorkingMessage.dump();
                 Conversation.dump();
                 LogTag.dumpInternalTables(this);
+                break;
+            case MENU_ADD_TEMPLATE:
+                startLoadingTemplates();
                 break;
         }
 
@@ -3185,7 +3256,15 @@ public class ComposeMessageActivity extends Activity
 
         // TextView.setTextKeepState() doesn't like null input.
         if (text != null) {
-            mTextEditor.setTextKeepState(text);
+            // Restore the emojis if necessary
+            SharedPreferences prefs = PreferenceManager
+                    .getDefaultSharedPreferences((Context) ComposeMessageActivity.this);
+            boolean enableEmojis = prefs.getBoolean(MessagingPreferenceActivity.ENABLE_EMOJIS, false);
+            if (enableEmojis) {
+                mTextEditor.setTextKeepState(EmojiParser.getInstance().addEmojiSpans(text));
+            } else {
+                mTextEditor.setTextKeepState(text);
+            }
         } else {
             mTextEditor.setText("");
         }
@@ -4078,6 +4157,70 @@ public class ComposeMessageActivity extends Activity
         mSmileyDialog.show();
     }
 
+    private void showEmojiDialog() {
+        if (mEmojiDialog == null) {
+            int[] icons = EmojiParser.DEFAULT_EMOJI_RES_IDS;
+
+            int layout = R.layout.emoji_insert_view;
+            mEmojiView = getLayoutInflater().inflate(layout, null);
+
+            final GridView gridView = (GridView) mEmojiView.findViewById(R.id.emoji_grid_view);
+            gridView.setAdapter(new ImageAdapter(this, icons));
+            final EditText editText = (EditText) mEmojiView.findViewById(R.id.emoji_edit_text);
+            final Button button = (Button) mEmojiView.findViewById(R.id.emoji_button);
+
+            gridView.setOnItemClickListener(new OnItemClickListener() {
+                public void onItemClick(AdapterView<?> parent, View v, int position, long id) {
+                    // We use the new unified Unicode 6.1 emoji code points
+                    CharSequence emoji = EmojiParser.getInstance().addEmojiSpans(EmojiParser.mEmojiTexts[position]);
+                    editText.append(emoji);
+                }
+            });
+
+            gridView.setOnItemLongClickListener(new OnItemLongClickListener() {
+                @Override
+                public boolean onItemLongClick(AdapterView<?> parent, View view, int position,
+                        long id) {
+                    // We use the new unified Unicode 6.1 emoji code points
+                    CharSequence emoji = EmojiParser.getInstance().addEmojiSpans(EmojiParser.mEmojiTexts[position]);
+                    if (mSubjectTextEditor != null && mSubjectTextEditor.hasFocus()) {
+                        mSubjectTextEditor.append(emoji);
+                    } else {
+                        mTextEditor.append(emoji);
+                    }
+                    mEmojiDialog.dismiss();
+                    return true;
+                }
+            });
+
+            button.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    if (mSubjectTextEditor != null && mSubjectTextEditor.hasFocus()) {
+                        mSubjectTextEditor.append(editText.getText());
+                    } else {
+                        mTextEditor.append(editText.getText());
+                    }
+                    mEmojiDialog.dismiss();
+                }
+            });
+
+            AlertDialog.Builder b = new AlertDialog.Builder(this);
+
+            b.setTitle(getString(R.string.menu_insert_emoji));
+
+            b.setCancelable(true);
+            b.setView(mEmojiView);
+
+            mEmojiDialog = b.create();
+        }
+
+        final EditText editText = (EditText) mEmojiView.findViewById(R.id.emoji_edit_text);
+        editText.setText("");
+
+        mEmojiDialog.show();
+    }
+
     @Override
     public void onUpdate(final Contact updated) {
         // Using an existing handler for the post, rather than conjuring up a new one.
@@ -4148,5 +4291,89 @@ public class ComposeMessageActivity extends Activity
             MessagingNotification.setCurrentlyDisplayedThreadId(mConversation.getThreadId());
         }
         // If we're not running, but resume later, the current thread ID will be set in onResume()
+    }
+
+    private void startLoadingTemplates() {
+        setProgressBarIndeterminateVisibility(true);
+        getLoaderManager().restartLoader(LOAD_TEMPLATES, null, this);
+    }
+
+    @Override
+    public void onGesturePerformed(GestureOverlayView overlay, Gesture gesture) {
+        ArrayList<Prediction> predictions = mLibrary.recognize(gesture);
+        for (Prediction prediction : predictions) {
+            if (prediction.score > mGestureSensitivity) {
+                Bundle b = new Bundle();
+                b.putLong("id", Long.parseLong(prediction.name));
+                getLoaderManager().initLoader(LOAD_TEMPLATE_BY_ID, b, this);
+            }
+        }
+    }
+
+    @Override
+    public Loader<Cursor> onCreateLoader(int id, Bundle args) {
+        if (id == LOAD_TEMPLATE_BY_ID) {
+            long rowID = args.getLong("id");
+            Uri uri = ContentUris.withAppendedId(Template.CONTENT_URI, rowID);
+            return new CursorLoader(this, uri, null, null, null, null);
+        } else {
+            return new CursorLoader(this, Template.CONTENT_URI, null, null, null, null);
+        }
+    }
+
+    @Override
+    public void onLoadFinished(Loader<Cursor> loader, Cursor data) {
+
+        if (loader.getId() == LOAD_TEMPLATE_BY_ID) {
+            if (data != null && data.getCount() > 0) {
+                data.moveToFirst();
+                String text = data.getString(data.getColumnIndex(Template.TEXT));
+                mTextEditor.append(text);
+            }
+        }else{
+            setProgressBarIndeterminateVisibility(false);
+            if(data != null && data.getCount() > 0){
+                showDialog(DIALOG_TEMPLATE_SELECT);
+                mTemplatesCursorAdapter.swapCursor(data);
+            }else{
+                showDialog(DIALOG_TEMPLATE_NOT_AVAILABLE);
+            }
+        }
+    }
+
+    @Override
+    public void onLoaderReset(Loader<Cursor> loader) {
+    }
+
+    @Override
+    protected Dialog onCreateDialog(int id, Bundle args) {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        switch (id) {
+            case DIALOG_TEMPLATE_NOT_AVAILABLE:
+                builder.setTitle(R.string.template_not_present_error_title);
+                builder.setMessage(R.string.template_not_present_error);
+                return builder.create();
+
+            case DIALOG_TEMPLATE_SELECT:
+                builder = new AlertDialog.Builder(this);
+                builder.setTitle(R.string.template_select);
+                mTemplatesCursorAdapter  = new SimpleCursorAdapter(this,
+                        android.R.layout.simple_list_item_1, null, new String[] {
+                        Template.TEXT
+                    }, new int[] {
+                        android.R.id.text1
+                    }, CursorAdapter.FLAG_REGISTER_CONTENT_OBSERVER);
+                builder.setAdapter(mTemplatesCursorAdapter, new DialogInterface.OnClickListener(){
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                       Cursor c = (Cursor) mTemplatesCursorAdapter.getItem(which);
+                       String text = c.getString(c.getColumnIndex(Template.TEXT));
+                       mTextEditor.append(text);
+                    }
+
+                });
+                return builder.create();
+        }
+        return super.onCreateDialog(id, args);
     }
 }
