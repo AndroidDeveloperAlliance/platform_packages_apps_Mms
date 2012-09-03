@@ -32,11 +32,11 @@ public class ManageWakeLock {
             return;
         }
 
-        ManageKeyguard.disableKeyguard(mContext);
+        ManageKeyguard.disableKeyguard(context);
 
-        PowerManager mPm = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
-        mWakeLock = mPm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK
-                | PowerManager.ACQUIRE_CAUSES_WAKEUP, LOG_TAG + ".full"); //Consider SCREEN_DIM_WAKE_LOCK;
+        PowerManager mPm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        mWakeLock = mPm.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK
+                | PowerManager.ACQUIRE_CAUSES_WAKEUP, LOG_TAG + ".full");
         mWakeLock.setReferenceCounted(false);
         mWakeLock.acquire();
 
