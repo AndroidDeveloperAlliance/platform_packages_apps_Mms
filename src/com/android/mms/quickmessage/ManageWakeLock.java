@@ -27,7 +27,7 @@ public class ManageWakeLock {
     private static volatile  PowerManager.WakeLock mPartialWakeLock = null;
     private static final int TIMEOUT = 20;
 
-    public static synchronized void acquireFull(Context mContext) {
+    public static synchronized void acquireFull(Context context) {
         if (mWakeLock != null) {
             return;
         }
@@ -41,7 +41,7 @@ public class ManageWakeLock {
         mWakeLock.acquire();
 
         // Set a receiver to remove all locks in "timeout" seconds
-        ClearAllReceiver.setCancel(mContext, TIMEOUT);
+        ClearAllReceiver.setCancel(context, TIMEOUT);
     }
 
     public static synchronized void acquirePartial(Context mContext) {

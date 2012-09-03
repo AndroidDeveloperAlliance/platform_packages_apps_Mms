@@ -1085,6 +1085,7 @@ public class MessagingNotification {
 
         // Post the notification
         nm.notify(NOTIFICATION_ID, notification);
+
     }
 
     protected static CharSequence buildTickerMessage(

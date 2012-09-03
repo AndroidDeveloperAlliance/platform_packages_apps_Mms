@@ -17,6 +17,7 @@
 package com.android.mms.quickmessage;
 
 import android.app.Activity;
+import android.app.KeyguardManager;
 import android.app.NotificationManager;
 import android.content.Context;
 import android.content.Intent;
@@ -35,9 +36,9 @@ import android.util.Log;
 import android.view.KeyEvent;
 import android.view.LayoutInflater;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.View.OnClickListener;
 import android.view.Window;
-import android.view.WindowManager.LayoutParams;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
@@ -84,9 +85,10 @@ public class QuickMessage extends Activity {
     private Button mViewButton;
 
     // General items
-    private Drawable sDefaultContactImage;
+    private Drawable mDefaultContactImage;
     private Context mContext;
     private boolean mScreenUnlocked = false;
+    private KeyguardManager mKeyguardManager = null;
 
     // Message list items
     private ArrayList<QuickMessageContent> mMessageList;
@@ -95,6 +97,7 @@ public class QuickMessage extends Activity {
 
     // Configuration
     private boolean mCloseClosesAll = false;
+    private boolean mWakeAndUnlock = false;
     private boolean mPageCounterAlwaysVisible = true;
 
     // Message pager
@@ -108,31 +111,13 @@ public class QuickMessage extends Activity {
         // Initialise the message list and other variables
         mContext = this;
         mMessageList = new ArrayList<QuickMessageContent>();
-
-        // Initialise the default contact image
-        if (sDefaultContactImage == null) {
-            sDefaultContactImage = getResources().getDrawable(R.drawable.ic_contact_picture);
-        }
+        mDefaultContactImage = getResources().getDrawable(R.drawable.ic_contact_picture);
+        mCloseClosesAll = MessagingPreferenceActivity.getQmCloseAllEnabled(mContext);
+        mWakeAndUnlock = MessagingPreferenceActivity.getQmLockscreenEnabled(mContext);
 
         // Set the window features and layout
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setContentView(R.layout.dialog_quickmessage);
-
-        // Prepare the window manager parameters
-        int flags = LayoutParams.FLAG_SHOW_WHEN_LOCKED
-                | LayoutParams.FLAG_TURN_SCREEN_ON
-                | LayoutParams.FLAG_DIM_BEHIND;
-        if (!MessagingPreferenceActivity.getQmLockscreenEnabled(mContext)) {
-            // We are set to 'Wake and unlock', add the flags
-            getWindow().addFlags(flags);
-            getWindow().setDimAmount(0.8f);
-        } else {
-            // We are not set to 'Wake and unlock', clear the flags
-            getWindow().clearFlags(flags);
-        }
-
-        // Load preferences
-        mCloseClosesAll = MessagingPreferenceActivity.getQmCloseAllEnabled(mContext);
 
         // Load the views and Parse the intent to show the QuickMessage
         setupViews();
@@ -269,15 +254,14 @@ public class QuickMessage extends Activity {
 
     private void unlockScreen() {
         // See if the lock screen should be disabled
-        if (!MessagingPreferenceActivity.getQmLockscreenEnabled(mContext)) {
+        if (!mWakeAndUnlock) {
             return;
         }
 
-        // Unlock screen if locked
-        ManageKeyguard.initialize(mContext);
-        if (ManageKeyguard.inKeyguardRestrictedInputMode()) {
+        // See if the screen is locked and get the wake lock to turn on the screen
+        mKeyguardManager = (KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
+        if (mKeyguardManager.inKeyguardRestrictedInputMode()) {
             ManageWakeLock.acquireFull(mContext);
-            ManageKeyguard.exitKeyguardSecurely(null);
             mScreenUnlocked = true;
         }
     }
@@ -326,14 +310,20 @@ public class QuickMessage extends Activity {
     }
 
     private void markAllMessagesRead() {
-        Conversation.markAllConversationsAsSeen(mContext);
+        // This iterates through our MessageList and marks the contained threads as read
+        for (QuickMessageContent qmc : mMessageList) {
+            Conversation con = Conversation.get(mContext, qmc.getThreadId(), true);
+            if (con != null) {
+                con.markAsRead();
+            }
+        }
     }
 
     private void updateContactBadge(QuickContactBadge badge, String addr, boolean isSelf) {
         Drawable avatarDrawable;
         if (isSelf || !TextUtils.isEmpty(addr)) {
             Contact contact = isSelf ? Contact.getMe(false) : Contact.get(addr, false);
-            avatarDrawable = contact.getAvatar(mContext, sDefaultContactImage);
+            avatarDrawable = contact.getAvatar(mContext, mDefaultContactImage);
 
             if (isSelf) {
                 badge.assignContactUri(Profile.CONTENT_URI);
@@ -345,7 +335,7 @@ public class QuickMessage extends Activity {
                 }
             }
         } else {
-            avatarDrawable = sDefaultContactImage;
+            avatarDrawable = mDefaultContactImage;
         }
         badge.setImageDrawable(avatarDrawable);
     }
@@ -373,11 +363,13 @@ public class QuickMessage extends Activity {
             (NotificationManager)getSystemService(Context.NOTIFICATION_SERVICE);
         notificationManager.cancel(mCurrentQm.getNotificationId());
 
-        // Clear the messages list and mark all conversations as seen
-        mMessageList.clear();
+        // Mark all contained conversations as seen
         if (markAsRead) {
             markAllMessagesRead();
         }
+
+        // Clear the messages list
+        mMessageList.clear();
     }
 
     private CharSequence formatMessage(String message) {
@@ -483,6 +475,8 @@ public class QuickMessage extends Activity {
     private class MessagePagerAdapter extends PagerAdapter
                     implements ViewPager.OnPageChangeListener {
 
+        protected LinearLayout mCurrentPrimaryLayout = null; 
+
         @Override
         public int getCount() {
             return mMessageList.size();
@@ -508,14 +502,18 @@ public class QuickMessage extends Activity {
             QuickMessageContent qm = mMessageList.get(position);
             if (qm != null) {
                 // Set the general fields
-                qmReplyText.setText(qm.getReplyText());
-                qmReplyText.setSelection(qm.getReplyText().length());
-                qmMessageText.setText(formatMessage(qm.getMessageBody()));
                 qmFromName.setText(qm.getFromName());
                 qmTimestamp.setText(qm.getTimestamp());
                 updateContactBadge(qmContactBadge, qm.getFromNumber()[0], false);
+                qmMessageText.setText(formatMessage(qm.getMessageBody()));
 
-                // Reply text handling
+                // We are using a holo.light background with a holo.dark activity theme
+                // Override the EditText background to use the holo.light theme
+                qmReplyText.setBackgroundResource(android.R.drawable.edit_text_holo_light);
+
+                // Set the remaining values
+                qmReplyText.setText(qm.getReplyText());
+                qmReplyText.setSelection(qm.getReplyText().length());
                 qmReplyText.addTextChangedListener(new QmTextWatcher(mContext, qmTextCounter, qmSendButton));
                 qmReplyText.setOnEditorActionListener(new OnEditorActionListener() {
                     @Override
@@ -589,6 +587,14 @@ public class QuickMessage extends Activity {
         }
 
         @Override
+        public void setPrimaryItem(ViewGroup container, int position, Object object) {
+            LinearLayout view = ((LinearLayout)object);
+            if (view != mCurrentPrimaryLayout) {
+                mCurrentPrimaryLayout = view;
+            }
+        }
+
+        @Override
         public void onPageSelected(int position) {
             // The user had scrolled to a new message
             if (mCurrentQm != null) {
@@ -604,12 +610,12 @@ public class QuickMessage extends Activity {
         @Override
         public int getItemPosition(Object object) {
             // This is needed to force notifyDatasetChanged() to rebuild the pages
-            return POSITION_NONE;
+            return PagerAdapter.POSITION_NONE;
         }
 
         @Override
         public void destroyItem(View collection, int position, Object view) {
-                ((ViewPager) collection).removeView((LinearLayout) view);
+            ((ViewPager) collection).removeView((LinearLayout) view);
         }
 
         @Override
@@ -618,15 +624,15 @@ public class QuickMessage extends Activity {
         }
 
         @Override
-        public void finishUpdate(View arg0) {
+        public void finishUpdate(View arg0) {}
+
+        @Override
+        public void restoreState(Parcelable arg0, ClassLoader arg1) {
         }
 
         @Override
-        public void restoreState(Parcelable arg0, ClassLoader arg1) {}
-
-        @Override
         public Parcelable saveState() {
-                return null;
+            return null;
         }
 
         @Override
